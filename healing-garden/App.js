@@ -14,12 +14,19 @@ import {
   Animated,
   PanResponder,
   Modal,
+  RefreshControl,
+  ActivityIndicator,
+  Linking,
 } from "react-native";
 import { SafeAreaView } from 'react-native-safe-area-context';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as ImagePicker from "expo-image-picker";
 import * as DocumentPicker from 'expo-document-picker';
 import { NavigationContainer, useNavigation } from "@react-navigation/native";
 import { createNativeStackNavigator } from "@react-navigation/native-stack";
+import { db } from './firebaseConfig';
+import { collection, doc, onSnapshot, setDoc, updateDoc, query, orderBy, limit, getDocs, getDoc } from 'firebase/firestore';
+import { OPENAI_API_KEY } from './config';
 
 const Stack = createNativeStackNavigator();
 
@@ -109,6 +116,11 @@ function SplashScreen({ navigation }) {
     <View style={styles.splashContainer}>
       <View style={styles.splashBackground}>
         <SafeAreaView style={styles.splashContent}>
+          <Image 
+            source={require('./assets/icon.png')} 
+            style={{ width: 120, height: 120, marginBottom: 24, borderRadius: 30 }} 
+            resizeMode="contain"
+          />
           <Text style={styles.splashSubtitle}>내 손안에 작은 공간</Text>
           <Text style={styles.splashSubtitle}>테라리움</Text>
           <Text style={styles.splashTitle}>Healing{"\n"}Garden</Text>
@@ -120,11 +132,224 @@ function SplashScreen({ navigation }) {
 
 /* ---------- 2. 홈 화면 ---------- */
 function HomeScreen({ navigation, terrariums, activeIndex, setActiveIndex, setTerrariums }) {
-  const temp = 22;
-  const hum = 55;
-  const lux = 55;
   // Keep card sizing stable by computing once and updating on dimension changes
   const scrollRef = useRef(null);
+  const [refreshing, setRefreshing] = useState(false);
+  const [selectedMood, setSelectedMood] = useState(null); // 0-4: 매우 좋음 ~ 매우 나빨
+  const [dailyDiary, setDailyDiary] = useState(''); // 한 줄 일기
+  const [aiRecommendation, setAiRecommendation] = useState(null);
+  const [loadingAI, setLoadingAI] = useState(false);
+  
+  // 최신 데이터 가져오기 함수
+  const fetchLatestData = async () => {
+    try {
+      const q = query(
+        collection(db, 'sensor_data'),
+        orderBy('timestamp', 'desc'),
+        limit(1)
+      );
+      
+      const snapshot = await getDocs(q);
+      console.log(`🔍 Total documents in query: ${snapshot.size}`);
+      
+      if (!snapshot.empty) {
+        const latestDoc = snapshot.docs[0];
+        const data = latestDoc.data();
+        
+        // 타임스탬프 확인
+        const timestamp = data.timestamp;
+        let dateStr = 'No timestamp';
+        if (timestamp) {
+          if (timestamp.toDate) {
+            dateStr = timestamp.toDate().toLocaleString('ko-KR');
+          } else if (typeof timestamp === 'string') {
+            dateStr = new Date(timestamp).toLocaleString('ko-KR');
+          }
+        }
+        
+        console.log('📊 Latest data timestamp:', dateStr);
+        console.log('📊 Raw Firestore data:', JSON.stringify(data, null, 2));
+        console.log('📊 Data keys:', Object.keys(data));
+        
+        // 다양한 필드명 시도 (temperature, temp 등)
+        const temp = data.temperature ?? data.temp ?? null;
+        const hum = data.humidity ?? data.hum ?? null;
+        const lux = data.light_level ?? data.lux ?? data.lightLevel ?? null;
+        
+        console.log(`📊 Parsed values - temp: ${temp}, hum: ${hum}, lux: ${lux}`);
+        
+        // 로즈마리 테라리움(index 0)에 데이터 업데이트
+        setTerrariums(prev => {
+          const updated = [...prev];
+          updated[0] = {
+            ...updated[0],
+            temp: typeof temp === 'number' ? temp : updated[0]?.temp,
+            hum: typeof hum === 'number' ? hum : updated[0]?.hum,
+            lux: typeof lux === 'number' ? lux : updated[0]?.lux,
+          };
+          return updated;
+        });
+      } else {
+        // 데이터가 없을 때는 조용히 처리 (하드웨어 팀이 업로드 준비 중)
+        console.log('📊 Waiting for sensor data...');
+      }
+    } catch (error) {
+      console.error('❌ Failed to fetch latest data:', error);
+    }
+  };
+  
+  // 수동 새로고침
+  const onRefresh = async () => {
+    setRefreshing(true);
+    await fetchLatestData();
+    setRefreshing(false);
+  };
+
+  // 기분과 일기를 Firestore에 저장
+  const saveMoodAndDiary = async (mood, diary) => {
+    try {
+      const today = new Date();
+      const dateStr = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-${String(today.getDate()).padStart(2, '0')}`;
+      
+      await setDoc(doc(db, 'mood_diary', dateStr), {
+        mood: mood,
+        diary: diary || '',
+        date: dateStr,
+        timestamp: new Date().toISOString(),
+      }, { merge: true });
+      
+      console.log('📝 Mood and diary saved:', { mood, diary });
+    } catch (error) {
+      console.error('Failed to save mood and diary:', error);
+    }
+  };
+  
+  // 초기 로드 & 주기적 갱신 (10초마다)
+  useEffect(() => {
+    fetchLatestData(); // 초기 로드
+    
+    const interval = setInterval(() => {
+      fetchLatestData();
+    }, 10000); // 10초마다 자동 갱신
+    
+    return () => clearInterval(interval);
+  }, []);
+
+  // GPT API로 AI 추천 받기
+  const getAIRecommendation = async () => {
+    if (selectedMood === null) {
+      Alert.alert('기분 선택', '먼저 오늘의 기분을 선택해주세요 😊');
+      return;
+    }
+
+    if (!OPENAI_API_KEY || OPENAI_API_KEY === 'YOUR_OPENAI_API_KEY_HERE') {
+      Alert.alert('API 키 필요', 'config.js 파일에 OpenAI API 키를 입력해주세요.\n\n1. https://platform.openai.com/api-keys 에서 키 발급\n2. config.js 파일에서 OPENAI_API_KEY 수정');
+      return;
+    }
+
+    setLoadingAI(true);
+    const current = terrariums[activeIndex] || {};
+    const moodLabels = ['매우 좋음 😄', '좋음 😊', '보통 😐', '나빨 😟', '매우 나빨 😢'];
+
+    try {
+      const response = await fetch('https://api.openai.com/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${OPENAI_API_KEY}`
+        },
+        body: JSON.stringify({
+          model: 'gpt-4o-mini',
+          messages: [
+            {
+              role: 'system',
+              content: '당신은 "새싹이"라는 귀여운 힐링가든 AI 어시스턴트입니다. 사용자의 기분과 일기 내용을 읽고, 공감하고 응원하는 따뜻한 메시지를 먼저 전달한 후, 테라리움 환경 제어를 추천해주세요. JSON 형식으로 응답: {"cheerMessage": "새싹이의 공감과 응원 메시지 (30-50자, 이모지 포함)", "message": "환경 제어 설명", "actions": [{"device": "fan|water_pump|light", "action": "on|off", "brightness": 0-255(조명만), "color": "#RRGGBB"(조명만), "reason": "이유"}]}. cheerMessage는 사용자의 기분과 일기 내용에 진심으로 공감하고 응원하는 내용으로 작성하세요.'
+            },
+            {
+              role: 'user',
+              content: `사용자 기분: ${moodLabels[selectedMood]}\n오늘의 일기: "${dailyDiary || '일기 없음'}"\n\n테라리웄: ${current.name} (${current.plantType})\n현재 환경:\n- 온도: ${current.temp ?? 0}°C\n- 습도: ${current.hum ?? 0}%\n- 조도: ${current.lux ?? 0} lx\n\n사용자의 기분과 일기 내용을 고려하여 테라리웄 환경을 어떻게 제어하면 좋을지 추천해주세요. 따뜻하고 공감하는 메시지로 응원해주세요.`
+            }
+          ],
+          temperature: 0.7,
+          max_tokens: 500
+        })
+      });
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        console.error('API error response:', errorText);
+        throw new Error(`API error: ${response.status} - 키를 확인해주세요`);
+      }
+
+      const data = await response.json();
+      const content = data.choices[0]?.message?.content;
+      
+      try {
+        const recommendation = JSON.parse(content);
+        setAiRecommendation(recommendation);
+      } catch (e) {
+        // JSON 파싱 실패 시 텍스트만 표시
+        setAiRecommendation({ message: content, actions: [] });
+      }
+    } catch (error) {
+      console.error('AI recommendation error:', error);
+      Alert.alert('오류', 'AI 추천을 가져오는데 실패했습니다.\n\n' + error.message + '\n\nconfig.js에서 API 키를 확인해주세요.');
+    } finally {
+      setLoadingAI(false);
+    }
+  };
+
+  // AI 추천 실행
+  const executeAIRecommendation = async () => {
+    if (!aiRecommendation || !aiRecommendation.actions || aiRecommendation.actions.length === 0) {
+      Alert.alert('실행 불가', '실행할 제어 명령이 없습니다.');
+      return;
+    }
+
+    try {
+      // 각 액션별로 API 호출
+      for (const action of aiRecommendation.actions) {
+        const isOn = action.action === 'on';
+        
+        if (action.device === 'fan') {
+          const fanEndpoint = isOn ? 'http://192.168.10.81:5000/api/fan/on' : 'http://192.168.10.81:5000/api/fan/off';
+          await fetch(fanEndpoint, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' }
+          });
+        } else if (action.device === 'water_pump') {
+          const pumpEndpoint = isOn ? 'http://192.168.10.81:5000/api/pump/on' : 'http://192.168.10.81:5000/api/pump/off';
+          await fetch(pumpEndpoint, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' }
+          });
+        } else if (action.device === 'light') {
+          if (isOn) {
+            const color = action.color || '#FFC864';
+            const r = parseInt(color.slice(1, 3), 16);
+            const g = parseInt(color.slice(3, 5), 16);
+            const b = parseInt(color.slice(5, 7), 16);
+            await fetch('http://192.168.10.81:5000/api/matrix/on', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ r, g, b })
+            });
+          } else {
+            await fetch('http://192.168.10.81:5000/api/matrix/off', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' }
+            });
+          }
+        }
+      }
+
+      Alert.alert('성공', 'AI 추천을 실행했습니다! 🌱');
+    } catch (error) {
+      console.error('Execute AI recommendation error:', error);
+      Alert.alert('오류', '제어 명령 실행에 실패했습니다.');
+    }
+  };
+
   // calculate layout and include left offset to align with header logo
   // pull the card a little further left (negative adjust) so the card's left edge visually lines up with the logo text
   const LOGO_LEFT = 12; // header paddingHorizontal + logoCircle width + logoRow marginLeft - tweak (-27 to nudge left)
@@ -176,7 +401,17 @@ function HomeScreen({ navigation, terrariums, activeIndex, setActiveIndex, setTe
     <SafeAreaView style={styles.screenBase}>
       <StatusBar barStyle="dark-content" />
       <HeaderLogo />
-  <ScrollView contentContainerStyle={[styles.screenScroll, { paddingTop: 24 }]}>
+  <ScrollView 
+    contentContainerStyle={[styles.screenScroll, { paddingTop: 24 }]}
+    refreshControl={
+      <RefreshControl
+        refreshing={refreshing}
+        onRefresh={onRefresh}
+        tintColor="#145c35"
+        colors={['#145c35']}
+      />
+    }
+  >
         {/* 테라리움 카드들: 가로 스와이프 캐러셀 */}
         <View style={{ position: "relative" }}>
         <ScrollView
@@ -256,6 +491,121 @@ function HomeScreen({ navigation, terrariums, activeIndex, setActiveIndex, setTe
           {terrariums.map((_, i) => (
             <View key={i} style={[styles.dot, i === activeIndex && styles.dotActive]} />
           ))}
+        </View>
+
+        {/* 오늘의 기분 선택 */}
+        <View style={[styles.card, { width: layout.CARD_WIDTH, alignSelf: 'center', marginTop: 16 }]}>
+          <Text style={styles.cardTitle}>오늘의 기분은 어떤신가요?</Text>
+          <View style={{ flexDirection: 'row', justifyContent: 'space-around', marginTop: 16, paddingHorizontal: 8 }}>
+            {['😄', '😊', '😐', '😟', '😢'].map((emoji, idx) => (
+              <TouchableOpacity
+                key={idx}
+                onPress={() => {
+                  setSelectedMood(idx);
+                  saveMoodAndDiary(idx, dailyDiary);
+                }}
+                style={[
+                  styles.moodButton,
+                  selectedMood === idx && { backgroundColor: '#c5f1c9', borderColor: '#145c35', borderWidth: 3 }
+                ]}
+              >
+                <Text style={{ fontSize: 32 }}>{emoji}</Text>
+              </TouchableOpacity>
+            ))}
+          </View>
+
+          {/* 한 줄 일기 입력 */}
+          <View style={{ marginTop: 16 }}>
+            <Text style={{ fontSize: 13, color: '#6b7280', marginBottom: 8 }}>📝 오늘 하루 한 줄로 표현해보세요</Text>
+            <TextInput
+              value={dailyDiary}
+              onChangeText={(text) => {
+                setDailyDiary(text);
+                if (selectedMood !== null) {
+                  saveMoodAndDiary(selectedMood, text);
+                }
+              }}
+              placeholder="예: 오늘은 날씨가 좋아서 기분이 좋았어요"
+              multiline
+              style={[styles.inputBox, { minHeight: 60, textAlignVertical: 'top', paddingTop: 10 }]}
+            />
+          </View>
+
+          {selectedMood !== null && (
+            <View style={{ marginTop: 16 }}>
+              <TouchableOpacity
+                style={[styles.addButton, { backgroundColor: loadingAI ? '#9ca3af' : '#145c35' }]}
+                onPress={getAIRecommendation}
+                disabled={loadingAI}
+              >
+                <Text style={styles.addButtonText}>
+                  {loadingAI ? 'AI 분석 중...' : '🤖 AI 환경 추천 받기'}
+                </Text>
+              </TouchableOpacity>
+            </View>
+          )}
+
+          {aiRecommendation && (
+            <View style={{ marginTop: 16, padding: 16, backgroundColor: '#f0fdf4', borderRadius: 12, borderWidth: 2, borderColor: '#86efac' }}>
+              {/* 새싹이 캐릭터 헤더 */}
+              <View style={{ flexDirection: 'row', alignItems: 'center', marginBottom: 12 }}>
+                <Text style={{ fontSize: 28, marginRight: 8 }}>🌱</Text>
+                <View>
+                  <Text style={{ fontSize: 16, fontWeight: '700', color: '#166534' }}>새싹이의 한마디!</Text>
+                  <Text style={{ fontSize: 11, color: '#15803d', marginTop: 2 }}>힐링가든 AI 어시스턴트</Text>
+                </View>
+              </View>
+
+              {/* 격려 메시지 - AI 생성 */}
+              <View style={{ backgroundColor: '#dcfce7', padding: 10, borderRadius: 8, marginBottom: 10 }}>
+                <Text style={{ fontSize: 13, color: '#166534', fontWeight: '600', textAlign: 'center' }}>
+                  {aiRecommendation.cheerMessage || '새싹이가 응원하고 있어요! 🌱'}
+                </Text>
+              </View>
+
+              {/* AI 추천 내용 */}
+              <View style={{ backgroundColor: 'white', padding: 10, borderRadius: 8, borderWidth: 1, borderColor: '#bbf7d0' }}>
+                <Text style={{ fontSize: 12, color: '#059669', fontWeight: '600', marginBottom: 6 }}>🌿 테라리움 환경 추천</Text>
+                <Text style={{ fontSize: 13, color: '#374151', marginBottom: 10, lineHeight: 18 }}>{aiRecommendation.message}</Text>
+                
+                {aiRecommendation.actions && aiRecommendation.actions.length > 0 && (
+                  <View>
+                    <Text style={{ fontSize: 11, color: '#6b7280', marginBottom: 6 }}>추천 제어 항목:</Text>
+                    {aiRecommendation.actions
+                      .filter(action => action.device !== 'water_pump') // 워터펌프 제외
+                      .map((action, idx) => (
+                      <View key={idx} style={{ marginBottom: 6, paddingLeft: 8, flexDirection: 'row', alignItems: 'center' }}>
+                        <Text style={{ fontSize: 16, marginRight: 6 }}>
+                          {action.device === 'fan' ? '💨' : '💡'}
+                        </Text>
+                        <View style={{ flex: 1 }}>
+                          <Text style={{ fontSize: 12, color: '#4b5563' }}>
+                            {action.device === 'fan' ? '환기' : '조명'} {action.action === 'on' ? 'ON' : 'OFF'}
+                            {action.device === 'light' && action.color && (
+                              <Text style={{ fontSize: 11, color: '#6b7280' }}> (색상: {action.color})</Text>
+                            )}
+                          </Text>
+                          <Text style={{ fontSize: 11, color: '#6b7280', marginTop: 2 }}>{action.reason}</Text>
+                          {action.device === 'light' && action.color && (
+                            <View style={{ flexDirection: 'row', alignItems: 'center', marginTop: 4 }}>
+                              <View style={{ width: 20, height: 20, borderRadius: 4, backgroundColor: action.color, borderWidth: 1, borderColor: '#d1d5db', marginRight: 6 }} />
+                              <Text style={{ fontSize: 10, color: '#9ca3af' }}>조명 색상 미리보기</Text>
+                            </View>
+                          )}
+                        </View>
+                      </View>
+                    ))}
+                    <TouchableOpacity
+                      style={[styles.addButton, { marginTop: 12, backgroundColor: '#10b981' }]}
+                      onPress={executeAIRecommendation}
+                    >
+                      <Text style={styles.addButtonText}>✨ 추천대로 실행하기</Text>
+                    </TouchableOpacity>
+                  </View>
+                )}
+              </View>
+            </View>
+          )}
         </View>
 
         {/* + 추가하기 버튼 */}
@@ -916,8 +1266,8 @@ function TerrariumControlScreen({ navigation, terrariums, setTerrariums, activeI
   // simulated device state
   const [waterPumpOn, setWaterPumpOn] = useState(false);
   const [growLightOn, setGrowLightOn] = useState(false);
-  const [heaterOn, setHeaterOn] = useState(false);
   const [ventOn, setVentOn] = useState(false);
+  const [ledColor, setLedColor] = useState('#FFC864'); // 조명 색상
   const [recommendations, setRecommendations] = useState([]);
   const [evaluating, setEvaluating] = useState(false);
   const [sampleVideos, setSampleVideos] = useState([
@@ -926,44 +1276,100 @@ function TerrariumControlScreen({ navigation, terrariums, setTerrariums, activeI
     { id: 's3', title: '선인장 성장 타임랩스', url: 'https://example.com/sample3.mp4' },
   ]);
 
-  // Fetch latest sensor snapshot from server when entering this screen (if available)
-  useEffect(() => {
-    let cancelled = false;
-    const fetchLatest = async () => {
-      try {
-        const resp = await fetch(`http://localhost:3000/sensors/${activeIndex}/latest`);
-        if (!resp.ok) return;
-        const data = await resp.json();
-        if (cancelled) return;
-        if (data && data.data) {
-          const s = data.data;
-          if (typeof s.temp === "number") setTemp(s.temp);
-          if (typeof s.hum === "number") setHum(s.hum);
-          if (typeof s.lux === "number") setLux(s.lux);
+  // 최신 센서 데이터 가져오기
+  const fetchLatestSensorData = async () => {
+    try {
+      const q = query(
+        collection(db, 'sensor_data'),
+        orderBy('timestamp', 'desc'),
+        limit(1)
+      );
+      
+      const snapshot = await getDocs(q);
+      if (!snapshot.empty) {
+        const latestDoc = snapshot.docs[0];
+        const data = latestDoc.data();
+        console.log('🎮 Control screen - Raw data:', JSON.stringify(data, null, 2));
+        
+        // 다양한 필드명 시도
+        const temp = data.temperature ?? data.temp ?? null;
+        const hum = data.humidity ?? data.hum ?? null;
+        const lux = data.light_level ?? data.lux ?? data.lightLevel ?? null;
+        
+        console.log(`🎮 Control parsed - temp: ${temp}, hum: ${hum}, lux: ${lux}`);
+        
+        if (typeof temp === "number") setTemp(temp);
+        if (typeof hum === "number") setHum(hum);
+        if (typeof lux === "number") setLux(lux);
 
-          // update global terrariums state so other screens reflect the latest snapshot
-          try {
-            const updated = [...terrariums];
-            updated[activeIndex] = {
-              ...(updated[activeIndex] || {}),
-              temp: typeof s.temp === 'number' ? s.temp : updated[activeIndex]?.temp,
-              hum: typeof s.hum === 'number' ? s.hum : updated[activeIndex]?.hum,
-              lux: typeof s.lux === 'number' ? s.lux : updated[activeIndex]?.lux,
-            };
-            setTerrariums(updated);
-          } catch (e) {
-            // ignore update errors
-          }
+        // update global terrariums state
+        try {
+          const updated = [...terrariums];
+          updated[activeIndex] = {
+            ...(updated[activeIndex] || {}),
+            temp: typeof data.temperature === 'number' ? data.temperature : updated[activeIndex]?.temp,
+            hum: typeof data.humidity === 'number' ? data.humidity : updated[activeIndex]?.hum,
+            lux: typeof data.light_level === 'number' ? data.light_level : updated[activeIndex]?.lux,
+          };
+          setTerrariums(updated);
+        } catch (e) {
+          console.warn('Error updating terrariums from Firestore:', e);
         }
-      } catch (e) {
-        // network failure — ignore and keep local values
-        console.warn('Failed to fetch latest sensor snapshot:', e.message || e);
       }
-    };
+    } catch (error) {
+      console.warn('Failed to fetch latest sensor data:', error);
+    }
+  };
 
-    fetchLatest();
+  // 장치 상태 로드 함수
+  const loadDeviceStates = async () => {
+    try {
+      const controlDoc = await getDoc(doc(db, 'device_control', 'rosemary_terrarium'));
+      if (controlDoc.exists()) {
+        const data = controlDoc.data();
+        console.log('🎛️ Loaded device states:', data);
+        
+        if (typeof data.water_pump === 'boolean') setWaterPumpOn(data.water_pump);
+        if (typeof data.fan === 'boolean') setVentOn(data.fan);
+        if (typeof data.led_brightness === 'number') setGrowLightOn(data.led_brightness > 0);
+      }
+    } catch (error) {
+      console.warn('Failed to load device states:', error);
+    }
+  };
+
+  // 초기 로드 & 주기적 갱신 (5초마다)
+  useEffect(() => {
+    if (activeIndex !== 0) return; // 로즈마리 테라리움만
+    
+    fetchLatestSensorData(); // 초기 로드
+    loadDeviceStates(); // 장치 상태 로드
+    
+    const interval = setInterval(() => {
+      fetchLatestSensorData();
+    }, 5000); // 5초마다 자동 갱신
+    
+    // Firestore 실시간 리스너 추가
+    const unsubscribe = onSnapshot(
+      doc(db, 'device_control', 'rosemary_terrarium'),
+      (docSnap) => {
+        if (docSnap.exists()) {
+          const data = docSnap.data();
+          console.log('🔄 Device state changed:', data);
+          
+          if (typeof data.water_pump === 'boolean') setWaterPumpOn(data.water_pump);
+          if (typeof data.fan === 'boolean') setVentOn(data.fan);
+          if (typeof data.led_brightness === 'number') setGrowLightOn(data.led_brightness > 0);
+        }
+      },
+      (error) => {
+        console.warn('Device state listener error:', error);
+      }
+    );
+    
     return () => {
-      cancelled = true;
+      clearInterval(interval);
+      unsubscribe();
     };
   }, [activeIndex]);
 
@@ -1009,7 +1415,7 @@ function TerrariumControlScreen({ navigation, terrariums, setTerrariums, activeI
 
     const ideal = { temp: { min: 20, max: 26 }, hum: { min: 40, max: 70 }, lux: { min: 50, max: 800 } };
     const recs = [];
-  if (temp < ideal.temp.min) recs.push({ id: "temp_low", message: `온도가 낮습니다 (${temp}°C). 온도를 올려주세요 (권장 ${ideal.temp.min}-${ideal.temp.max}°C).`, actionLabel: "히터 가동", actionKey: "heater_on" });
+  if (temp < ideal.temp.min) recs.push({ id: "temp_low", message: `온도가 낮습니다 (${temp}°C). 온도를 올려주세요 (권장 ${ideal.temp.min}-${ideal.temp.max}°C).`, actionLabel: "알림만", actionKey: "none" });
     else if (temp > ideal.temp.max) recs.push({ id: "temp_high", message: `온도가 높습니다 (${temp}°C). 환기하거나 냉각하세요.`, actionLabel: "환기", actionKey: "vent" });
   if (hum < ideal.hum.min) recs.push({ id: "hum_low", message: `습도가 낮습니다 (${hum}%). 워터펌프를 작동시켜 습도를 올려보세요.`, actionLabel: "워터펌프 ON", actionKey: "water_pump_on" });
     else if (hum > ideal.hum.max) recs.push({ id: "hum_high", message: `습도가 높습니다 (${hum}%). 환기를 하거나 분무를 멈추세요.`, actionLabel: "워터펌프 OFF", actionKey: "water_pump_off" });
@@ -1022,124 +1428,118 @@ function TerrariumControlScreen({ navigation, terrariums, setTerrariums, activeI
     return recs;
   };
 
-  const performAction = (actionKey) => {
-    // Try to send device control to server; if server unavailable, fall back to local simulation.
-    (async () => {
-      try {
-        const resp = await fetch("http://localhost:3000/devices/control", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ actionKey, id: activeIndex }),
-        });
-        if (resp.ok) {
-          const data = await resp.json();
-          // server may return updated sensor snapshot
-          if (data && data.updated) {
-            const { temp: t, hum: h, lux: l } = data.updated;
-            if (typeof t === 'number') setTemp(t);
-            if (typeof h === 'number') setHum(h);
-            if (typeof l === 'number') setLux(l);
-          }
-
-          // update device on/off states based on actionKey (explicit on/off keys preferred)
-          if (actionKey === 'water_pump' || actionKey === 'water_pump_on') setWaterPumpOn(true);
-          else if (actionKey === 'water_pump_off') setWaterPumpOn(false);
-          else if (actionKey === 'grow_light' || actionKey === 'grow_light_on') setGrowLightOn(true);
-          else if (actionKey === 'grow_light_off') setGrowLightOn(false);
-          else if (actionKey === 'heater_on') setHeaterOn(true);
-          else if (actionKey === 'heater_off') setHeaterOn(false);
-          else if (actionKey === 'heater') setHeaterOn((v) => !v);
-          else if (actionKey === 'vent_on') setVentOn(true);
-          else if (actionKey === 'vent_off') setVentOn(false);
-          else if (actionKey === 'vent') setVentOn((v) => !v);
-
-          // Friendly alert messages: map actionKey to ON/OFF user text so the alert matches the intended state
-          const friendly = (() => {
-            if (actionKey.indexOf('heater') === 0) {
-              if (actionKey.indexOf('_on') !== -1) return { title: '히터 ON', body: '히터를 가동했습니다.' };
-              if (actionKey.indexOf('_off') !== -1) return { title: '히터 OFF', body: '히터를 중지했습니다.' };
-              return { title: '히터', body: '히터 상태가 변경되었습니다.' };
-            }
-            if (actionKey.indexOf('vent') === 0) {
-              if (actionKey.indexOf('_on') !== -1) return { title: '환기 ON', body: '환기를 시작합니다.' };
-              if (actionKey.indexOf('_off') !== -1) return { title: '환기 OFF', body: '환기를 중지합니다.' };
-              return { title: '환기', body: '환기 상태가 변경되었습니다.' };
-            }
-            if (actionKey.indexOf('water_pump') === 0) {
-              if (actionKey.indexOf('_on') !== -1) return { title: '워터펌프 ON', body: '워터펌프를 작동합니다.' };
-              if (actionKey.indexOf('_off') !== -1) return { title: '워터펌프 OFF', body: '워터펌프를 중지합니다.' };
-              return { title: '워터펌프', body: '워터펌프 상태가 변경되었습니다.' };
-            }
-            if (actionKey.indexOf('grow_light') === 0) {
-              if (actionKey.indexOf('_on') !== -1) return { title: '조명 ON', body: '조명을 켰습니다.' };
-              if (actionKey.indexOf('_off') !== -1) return { title: '조명 OFF', body: '조명을 껐습니다.' };
-              return { title: '조명', body: '조명 상태가 변경되었습니다.' };
-            }
-            // default
-            return { title: '장치 제어', body: `서버에 액션을 전송했습니다: ${actionKey}` };
-          })();
-
-          Alert.alert(friendly.title, friendly.body);
+  const performAction = async (actionKey) => {
+    // API로 직접 제어 명령 전송
+    try {
+      let endpoint = '';
+      let payload = {};
+      
+      // actionKey에 따라 API 엔드포인트 결정
+      if (actionKey === 'water_pump_on' || actionKey === 'water_pump_off') {
+        endpoint = 'http://192.168.10.81:5000/api/pump/' + (actionKey === 'water_pump_on' ? 'on' : 'off');
+        payload = {};
+        setWaterPumpOn(actionKey === 'water_pump_on');
+      } else if (actionKey === 'vent_on' || actionKey === 'vent_off' || actionKey === 'vent') {
+        endpoint = 'http://192.168.10.81:5000/api/fan/' + (actionKey === 'vent_off' ? 'off' : 'on');
+        payload = {};
+        setVentOn(actionKey !== 'vent_off');
+      } else if (actionKey === 'grow_light_on' || actionKey === 'grow_light_off') {
+        if (actionKey === 'grow_light_on') {
+          endpoint = 'http://192.168.10.81:5000/api/matrix/on';
+          // RGB 값 계산 (HEX -> RGB)
+          const color = ledColor || '#FFC864';
+          const r = parseInt(color.slice(1, 3), 16);
+          const g = parseInt(color.slice(3, 5), 16);
+          const b = parseInt(color.slice(5, 7), 16);
+          payload = { r, g, b };
         } else {
-          throw new Error('device control failed');
+          endpoint = 'http://192.168.10.81:5000/api/matrix/off';
+          payload = {};
         }
-        } catch (e) {
-        // fallback local simulation
-        if (actionKey === "water_pump" || actionKey === "water_pump_on") {
-          setWaterPumpOn(true);
-          const newHum = Math.min(100, hum + 10);
-          setHum(newHum);
-          Alert.alert("워터펌프 작동 (로컬)", "워터펌프가 켜졌습니다. 습도가 증가합니다.");
-        } else if (actionKey === "water_pump_off") {
-          setWaterPumpOn(false);
-          Alert.alert("워터펌프 중지 (로컬)", "워터펌프를 끕니다.");
-        } else if (actionKey === "grow_light" || actionKey === "grow_light_on") {
-          setGrowLightOn(true);
-          const newLux = Math.min(2000, lux + 200);
-          setLux(newLux);
-          Alert.alert("조명 ON (로컬)", "조명을 켰습니다. 조도가 증가합니다.");
-        } else if (actionKey === "grow_light_off") {
-          setGrowLightOn(false);
-          Alert.alert("조명 OFF (로컬)", "조명을 껐습니다.");
-        } else if (actionKey === "heater_on") {
-          setHeaterOn(true);
-          const newTemp = Math.min(50, temp + 2);
-          setTemp(newTemp);
-          Alert.alert("히터 ON (로컬)", "히터를 가동하여 온도를 조금 올립니다.");
-        } else if (actionKey === "heater_off") {
-          setHeaterOn(false);
-          Alert.alert("히터 OFF (로컬)", "히터를 중지합니다.");
-        } else if (actionKey === "heater") {
-          setHeaterOn((v) => !v);
-          const newTemp = Math.min(50, temp + 2);
-          setTemp(newTemp);
-          Alert.alert("히터 ON (로컬)", "히터를 가동하여 온도를 조금 올립니다.");
-        } else if (actionKey === "vent_on") {
-          setVentOn(true);
-          const newTemp = Math.max(-10, temp - 2);
-          setTemp(newTemp);
-          Alert.alert("환기 (로컬)", "환기를 통해 온도를 낮춥니다.");
-        } else if (actionKey === "vent_off") {
-          setVentOn(false);
-          Alert.alert("환기 중지 (로컬)", "환기를 중지합니다.");
-        } else if (actionKey === "vent") {
-          setVentOn((v) => !v);
-          const newTemp = Math.max(-10, temp - 2);
-          setTemp(newTemp);
-          Alert.alert("환기 (로컬)", "환기를 통해 온도를 낮춥니다.");
-        }
-      } finally {
-        // update shared terrariums state so other screens see the change
-        const updated = [...terrariums];
-        updated[activeIndex] = {
-          ...(updated[activeIndex] || {}),
-          temp,
-          hum,
-          lux,
-        };
-        setTerrariums(updated);
+        setGrowLightOn(actionKey === 'grow_light_on');
       }
-    })();
+      
+      if (!endpoint) {
+        console.warn('Unknown action key:', actionKey);
+        return;
+      }
+      
+      // API 호출
+      const fetchOptions = {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        cache: 'no-cache'
+      };
+      
+      // payload가 비어있지 않을 때만 body 추가
+      if (Object.keys(payload).length > 0) {
+        fetchOptions.body = JSON.stringify(payload);
+      }
+      
+      console.log('🔵 API 요청:', endpoint, fetchOptions);
+      const response = await fetch(endpoint, fetchOptions);
+      console.log('🟢 API 응답 상태:', response.status, response.ok);
+      
+      // 응답 내용 파싱
+      const responseText = await response.text();
+      console.log('📄 API 응답 내용:', responseText);
+      
+      let result;
+      try {
+        result = JSON.parse(responseText);
+      } catch (e) {
+        console.error('❌ JSON 파싱 실패:', e);
+        result = { success: false, error: responseText };
+      }
+      
+      console.log('📦 파싱된 결과:', result);
+      
+      // 200 응답이면 성공!
+      if (response.ok) {
+        Alert.alert('성공', '제어 명령이 전송되었습니다! 🌱');
+        return; // 성공했으면 여기서 끝
+      } 
+      
+      // 200이 아니면 에러
+      const errorMsg = result.message || result.error || `HTTP 오류: ${response.status}`;
+      throw new Error(errorMsg);
+    } catch (error) {
+      console.error('API control error:', error);
+      Alert.alert('오류', '제어 명령 전송에 실패했습니다: ' + error.message);
+    }
+  };
+
+  // 색상 변경 함수 (내부적으로 끄고 다시 켜기)
+  const changeLedColor = async (color) => {
+    setLedColor(color);
+    try {
+      // 1단계: LED 끄기 (내부 처리, UI에는 표시 안 함)
+      await fetch('http://192.168.10.81:5000/api/matrix/off', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' }
+      });
+      
+      // 짧은 딜레이 (하드웨어 처리 시간)
+      await new Promise(resolve => setTimeout(resolve, 100));
+      
+      // 2단계: 새로운 색상으로 LED 켜기
+      const r = parseInt(color.slice(1, 3), 16);
+      const g = parseInt(color.slice(3, 5), 16);
+      const b = parseInt(color.slice(5, 7), 16);
+      
+      const response = await fetch('http://192.168.10.81:5000/api/matrix/on', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ r, g, b })
+      });
+      
+      if (response.ok) {
+        console.log('✅ LED 색상 변경 성공 (끄기→켜기):', color);
+        setGrowLightOn(true); // 상태도 켜짐으로 변경
+      }
+    } catch (error) {
+      console.error('색상 변경 실패:', error);
+    }
   };
   
   // LCD control: allows sending play/pause/stop/set_url commands to the server
@@ -1173,8 +1573,11 @@ function TerrariumControlScreen({ navigation, terrariums, setTerrariums, activeI
           <Text style={styles.cardTitle}>{current.name || "(선택된 테라리움 없음)"}</Text>
           <View style={{ marginTop: 10 }}>
             <View style={styles.terrariumImagePlaceholder}>
-              {/* 이미지 대신 실시간 웹캠 뷰를 렌더링합니다. (웹에서는 브라우저 카메라 권한 요청) */}
-              <WebCamView />
+              {current.image ? (
+                <Image source={{ uri: current.image }} style={styles.terrariumImage} resizeMode="cover" />
+              ) : (
+                <Text style={{ color: "#64748b", fontSize: 12 }}>테라리웄 이미지 자리</Text>
+              )}
             </View>
 
             <View style={{ marginTop: 12 }}>
@@ -1183,25 +1586,20 @@ function TerrariumControlScreen({ navigation, terrariums, setTerrariums, activeI
                 <SensorCircle label="습도" value={`${hum}%`} numeric={typeof hum === 'number' ? hum : null} />
                 <SensorCircle label="조도" value={`${lux} lx`} numeric={typeof lux === 'number' ? lux : null} ledColor={current.ledColor} />
               </View>
+              
+              {/* 데이터 기록 보기 버튼 */}
+              <TouchableOpacity
+                style={[styles.addButton, { marginTop: 12, backgroundColor: '#0ea5e9' }]}
+                onPress={() => navigation.navigate('SensorHistory')}
+              >
+                <Text style={styles.addButtonText}>📊 과거 데이터 기록 보기</Text>
+              </TouchableOpacity>
             </View>
 
             {/* 장치 제어: 스와이프/토글 방식 */}
             <View style={{ marginTop: 16 }}>
               <Text style={{ fontSize: 14, fontWeight: '600', marginBottom: 8 }}>장치 제어</Text>
               <View style={{ marginTop: 6 }}>
-                <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
-                  <View style={{ flexDirection: 'row', alignItems: 'center' }}>
-                    <Text style={{ fontSize: 14, color: '#111827', marginRight: 12 }}>히터</Text>
-                  </View>
-                  <ToggleSwitch
-                    value={heaterOn}
-                    onValueChange={(v) => { setHeaterOn(v); performAction(v ? 'heater_on' : 'heater_off'); }}
-                    onColor="#f97316"
-                    offColor="#e5e7eb"
-                    leftIsOn={false}
-                  />
-                </View>
-
                 <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
                   <Text style={{ fontSize: 14, color: '#111827' }}>환기 (모터)</Text>
                   <ToggleSwitch
@@ -1224,15 +1622,105 @@ function TerrariumControlScreen({ navigation, terrariums, setTerrariums, activeI
                   />
                 </View>
 
-                <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}>
-                  <Text style={{ fontSize: 14, color: '#111827' }}>조명</Text>
-                  <ToggleSwitch
-                    value={growLightOn}
-                    onValueChange={(v) => { setGrowLightOn(v); performAction(v ? 'grow_light_on' : 'grow_light_off'); }}
-                    onColor="#f59e0b"
-                    offColor="#6b7280"
-                    leftIsOn={false}
-                  />
+                {/* 조명 색상 선택 */}
+                <View style={{ marginTop: 12 }}>
+                  <Text style={{ fontSize: 14, fontWeight: '600', color: '#111827', marginBottom: 12 }}>조명 제어</Text>
+                  
+                  {/* 색상 그리드 */}
+                  <View style={{ flexDirection: 'row', flexWrap: 'wrap', justifyContent: 'center', gap: 8 }}>
+                    {/* 끄기 버튼 (맨 위 중앙) */}
+                    <View style={{ width: '100%', alignItems: 'center', marginBottom: 8 }}>
+                      <TouchableOpacity
+                        onPress={() => {
+                          setGrowLightOn(false);
+                          performAction('grow_light_off');
+                        }}
+                        style={{
+                          alignItems: 'center',
+                        }}
+                      >
+                        <View style={{
+                          width: 60,
+                          height: 60,
+                          borderRadius: 30,
+                          backgroundColor: '#1f2937',
+                          borderWidth: growLightOn ? 2 : 3,
+                          borderColor: growLightOn ? '#d1d5db' : '#ef4444',
+                          shadowColor: '#000',
+                          shadowOffset: { width: 0, height: 2 },
+                          shadowOpacity: 0.2,
+                          shadowRadius: 4,
+                          elevation: 4,
+                          alignItems: 'center',
+                          justifyContent: 'center',
+                        }}>
+                          <Text style={{ fontSize: 24 }}>⚫</Text>
+                        </View>
+                        <Text style={{ fontSize: 12, color: '#111827', marginTop: 4, fontWeight: '700' }}>꺼짐</Text>
+                      </TouchableOpacity>
+                    </View>
+
+                    {/* 색상 선택 버튼들 */}
+                    {[
+                      { name: '빨강', color: '#cf7474ff' },
+                      { name: '주황', color: '#ff8d1aff' },
+                      { name: '노랑', color: '#ffef0aff' },
+                      { name: '연두', color: '#7FFF00' },
+                      { name: '초록', color: '#00FF00' },
+                      { name: '청록', color: '#00FF7F' },
+                      { name: '하늘', color: '#00FFFF' },
+                      { name: '파랑', color: '#0000FF' },
+                      { name: '남색', color: '#4B0082' },
+                      { name: '보라', color: '#8B00FF' },
+                      { name: '자주', color: '#FF00FF' },
+                      { name: '분홍', color: '#FF1493' },
+                      { name: '흰색', color: '#FFFFFF' },
+                      { name: '따뜻한 흰색', color: '#FFF8DC' },
+                      { name: '주황빛', color: '#FFC864' },
+                    ].map((item) => (
+                      <TouchableOpacity
+                        key={item.color}
+                        onPress={() => changeLedColor(item.color)}
+                        style={{
+                          alignItems: 'center',
+                          marginBottom: 8,
+                        }}
+                      >
+                        <View style={{
+                          width: 50,
+                          height: 50,
+                          borderRadius: 25,
+                          backgroundColor: item.color,
+                          borderWidth: (growLightOn && ledColor === item.color) ? 3 : 2,
+                          borderColor: (growLightOn && ledColor === item.color) ? '#059669' : '#d1d5db',
+                          shadowColor: '#000',
+                          shadowOffset: { width: 0, height: 2 },
+                          shadowOpacity: 0.1,
+                          shadowRadius: 3,
+                          elevation: 3,
+                        }} />
+                        <Text style={{ fontSize: 10, color: '#6b7280', marginTop: 4 }}>{item.name}</Text>
+                      </TouchableOpacity>
+                    ))}
+                  </View>
+                  
+                  {/* 현재 상태 표시 */}
+                  {growLightOn && (
+                    <View style={{ marginTop: 16, padding: 12, backgroundColor: '#f0fdf4', borderRadius: 8, flexDirection: 'row', alignItems: 'center', gap: 12, borderWidth: 2, borderColor: '#86efac' }}>
+                      <View style={{
+                        width: 40,
+                        height: 40,
+                        borderRadius: 20,
+                        backgroundColor: ledColor,
+                        borderWidth: 2,
+                        borderColor: '#059669'
+                      }} />
+                      <View>
+                        <Text style={{ fontSize: 12, color: '#166534', fontWeight: '600' }}>조명 켜짐 ✨</Text>
+                        <Text style={{ fontSize: 14, fontWeight: '700', color: '#111827' }}>{ledColor}</Text>
+                      </View>
+                    </View>
+                  )}
                 </View>
               </View>
             </View>
@@ -1438,11 +1926,38 @@ function TerrariumSettingsScreen({ navigation, terrariums, setTerrariums, active
 
   const pickImage = async () => {
     try {
+      // 권한 요청
       const perm = await ImagePicker.requestMediaLibraryPermissionsAsync();
+      
       if (perm.status !== "granted") {
-        Alert.alert("권한 필요", "갤러리 접근 권한이 필요합니다.");
+        // 권한이 거부된 경우
+        if (perm.canAskAgain === false) {
+          // 다시 물어볼 수 없는 경우 (영구 거부)
+          Alert.alert(
+            "권한 필요", 
+            "갤러리 접근 권한이 필요합니다. 설정에서 권한을 허용해주세요.",
+            [
+              { text: "취소", style: "cancel" },
+              { 
+                text: "설정으로 이동", 
+                onPress: () => {
+                  if (Platform.OS === 'ios') {
+                    Linking.openURL('app-settings:');
+                  } else {
+                    Linking.openSettings();
+                  }
+                }
+              }
+            ]
+          );
+        } else {
+          // 다시 물어볼 수 있는 경우
+          Alert.alert("권한 필요", "갤러리 접근 권한이 필요합니다. 권한을 허용해주세요.");
+        }
         return;
       }
+      
+      // 권한이 허용된 경우 이미지 선택
       const result = await ImagePicker.launchImageLibraryAsync({
         mediaTypes: ImagePicker.MediaTypeOptions.Images,
         allowsEditing: true,
@@ -1455,6 +1970,7 @@ function TerrariumSettingsScreen({ navigation, terrariums, setTerrariums, active
       if (uri) setImage(uri);
     } catch (e) {
       console.warn("pickImage error", e);
+      Alert.alert("오류", "이미지를 불러오는 중 오류가 발생했습니다.");
     }
   };
 
@@ -1627,13 +2143,12 @@ function CalendarScreen({ navigation, terrariums, setTerrariums, activeIndex }) 
   const [year, setYear] = useState(today.getFullYear());
   const [month, setMonth] = useState(today.getMonth()); // 0-based
   const [events, setEvents] = useState([]); // {id, date:'YYYY-MM-DD', time:'HH:MM', title, actionKey}
+  const [moodDiaryData, setMoodDiaryData] = useState(null); // 오늘의 기분과 일기
   const [selectedDate, setSelectedDate] = useState(null);
   const [modalOpen, setModalOpen] = useState(false);
   const [formTitle, setFormTitle] = useState('');
   const [formTime, setFormTime] = useState('12:00');
   const ACTIONS = [
-    { key: 'heater_on', label: '히터 ON' },
-    { key: 'heater_off', label: '히터 OFF' },
     { key: 'vent_on', label: '환기 ON' },
     { key: 'vent_off', label: '환기 OFF' },
     { key: 'water_pump_on', label: '워터펌프 ON' },
@@ -1665,6 +2180,21 @@ function CalendarScreen({ navigation, terrariums, setTerrariums, activeIndex }) 
       }
     };
     load();
+
+    // 오늘의 기분과 일기 불러오기
+    const loadTodayMoodDiary = async () => {
+      try {
+        const todayStr = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-${String(today.getDate()).padStart(2, '0')}`;
+        const docSnap = await getDoc(doc(db, 'mood_diary', todayStr));
+        if (docSnap.exists()) {
+          setMoodDiaryData(docSnap.data());
+          console.log('📅 Today mood diary loaded:', docSnap.data());
+        }
+      } catch (error) {
+        console.warn('Failed to load today mood diary:', error);
+      }
+    };
+    loadTodayMoodDiary();
   }, [activeIndex]);
 
   const openDay = (d) => {
@@ -1801,6 +2331,28 @@ function CalendarScreen({ navigation, terrariums, setTerrariums, activeIndex }) 
           </View>
         </View>
 
+        {/* 오늘의 기분과 일기 */}
+        {moodDiaryData && (
+          <View style={[styles.card, { marginTop: 16, backgroundColor: '#fefce8', borderColor: '#fde047', borderWidth: 2 }]}>
+            <Text style={styles.cardTitle}>📅 오늘의 기분과 일기</Text>
+            <View style={{ marginTop: 12 }}>
+              <View style={{ flexDirection: 'row', alignItems: 'center', marginBottom: 10 }}>
+                <Text style={{ fontSize: 14, color: '#78716c', marginRight: 8 }}>오늘의 기분:</Text>
+                <Text style={{ fontSize: 32 }}>
+                  {['😄', '😊', '😐', '😟', '😢'][moodDiaryData.mood] || '😐'}
+                </Text>
+              </View>
+              {moodDiaryData.diary && (
+                <View style={{ backgroundColor: 'white', padding: 10, borderRadius: 8, borderWidth: 1, borderColor: '#fde047' }}>
+                  <Text style={{ fontSize: 13, color: '#57534e', lineHeight: 20 }}>
+                    "{moodDiaryData.diary}"
+                  </Text>
+                </View>
+              )}
+            </View>
+          </View>
+        )}
+
       </ScrollView>
 
       <Modal visible={modalOpen} animationType="slide" transparent={true}>
@@ -1832,63 +2384,172 @@ function CalendarScreen({ navigation, terrariums, setTerrariums, activeIndex }) 
   );
 }
 
-/* ---------- WebCam view component (web: navigator.mediaDevices, native: placeholder) ---------- */
-function WebCamView() {
-  const videoRef = useRef(null);
+/* ---------- 센서 데이터 기록 화면 ---------- */
+function SensorHistoryScreen({ navigation }) {
+  const [historyData, setHistoryData] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
+
+  const loadHistory = async (isRefresh = false) => {
+    if (isRefresh) setRefreshing(true);
+    else setLoading(true);
+
+    try {
+      // Firestore에서 최근 50개 데이터 가져오기
+      const q = query(
+        collection(db, 'sensor_data'),
+        orderBy('timestamp', 'desc'),
+        limit(50)
+      );
+      
+      const snapshot = await getDocs(q);
+      const data = snapshot.docs.map(doc => ({
+        id: doc.id,
+        ...doc.data(),
+      }));
+      
+      console.log(`Loaded ${data.length} history records`);
+      setHistoryData(data);
+    } catch (error) {
+      console.error('Failed to load history:', error);
+      Alert.alert('오류', '데이터를 불러오는데 실패했습니다: ' + error.message);
+    } finally {
+      setLoading(false);
+      setRefreshing(false);
+    }
+  };
 
   useEffect(() => {
-    let stream = null;
-    if (Platform.OS === "web" && typeof navigator !== "undefined" && navigator.mediaDevices) {
-      const start = async () => {
-        try {
-          stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
-          if (videoRef.current) {
-            // @ts-ignore - web video element
-            videoRef.current.srcObject = stream;
-            // autoplay may require a user gesture; playsInline helps on mobile web
-            try {
-              videoRef.current.play && videoRef.current.play();
-            } catch (e) {
-              // ignore play errors
-            }
-          }
-        } catch (e) {
-          console.warn("getUserMedia error:", e);
-        }
-      };
-      start();
-    }
-
-    return () => {
-      if (stream) {
-        stream.getTracks().forEach((t) => t.stop());
-      }
-    };
+    loadHistory();
   }, []);
 
-  if (Platform.OS === "web") {
-    // Using a plain <video> element works on web (expo web / react-native-web will render it into DOM).
-    return (
-      // eslint-disable-next-line react-native/no-inline-styles
-      <View style={{ width: "100%", height: 180, borderRadius: 12, overflow: "hidden" }}>
-        {/* @ts-ignore */}
-        <video
-          ref={videoRef}
-          style={{ width: "100%", height: "100%", objectFit: "cover" }}
-          autoPlay
-          playsInline
-          muted
-        />
-      </View>
-    );
-  }
+  const formatTimestamp = (timestamp) => {
+    if (!timestamp) return '시간 없음';
+    
+    // Firestore Timestamp 객체 또는 문자열 처리
+    let date;
+    if (timestamp.toDate) {
+      date = timestamp.toDate();
+    } else if (typeof timestamp === 'string') {
+      date = new Date(timestamp);
+    } else {
+      return '시간 없음';
+    }
+    
+    const month = date.getMonth() + 1;
+    const day = date.getDate();
+    const hours = date.getHours();
+    const minutes = date.getMinutes().toString().padStart(2, '0');
+    
+    return `${month}/${day} ${hours}:${minutes}`;
+  };
 
   return (
-    <View style={{ width: "100%", height: 180, alignItems: "center", justifyContent: "center" }}>
-      <Text style={{ color: "#64748b", fontSize: 12, textAlign: "center" }}>
-        모바일에서는 실시간 카메라 미리보기를 사용하려면 'expo-camera' 설치 및 권한 요청이 필요합니다.
-      </Text>
-    </View>
+    <SafeAreaView style={styles.screenBase}>
+      <HeaderLogo />
+      <ScrollView 
+        contentContainerStyle={styles.screenScroll}
+        refreshControl={
+          <RefreshControl
+            refreshing={refreshing}
+            onRefresh={() => loadHistory(true)}
+            tintColor="#145c35"
+            colors={['#145c35']}
+          />
+        }
+      >
+        <Text style={styles.sectionTitle}>📊 센서 데이터 기록</Text>
+        
+        <View style={[styles.card, { marginTop: 12 }]}>
+          <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
+            <Text style={styles.cardTitle}>로즈마리 테라리움</Text>
+            <TouchableOpacity 
+              onPress={() => loadHistory(true)}
+              style={{ padding: 8, backgroundColor: '#f0fdf4', borderRadius: 8 }}
+            >
+              <Text style={{ fontSize: 20 }}>🔄</Text>
+            </TouchableOpacity>
+          </View>
+          <Text style={{ color: '#6b7280', fontSize: 13 }}>
+            최근 50개 데이터 · 아래로 당겨서 새로고침
+          </Text>
+        </View>
+
+        {loading ? (
+          <View style={{ marginTop: 40, alignItems: 'center' }}>
+            <ActivityIndicator size="large" color="#145c35" />
+            <Text style={{ marginTop: 12, color: '#6b7280' }}>데이터 로딩 중...</Text>
+          </View>
+        ) : historyData.length === 0 ? (
+          <View style={[styles.card, { marginTop: 20 }]}>
+            <Text style={{ color: '#6b7280', textAlign: 'center' }}>
+              저장된 데이터가 없습니다.
+            </Text>
+          </View>
+        ) : (
+          <View style={{ marginTop: 16 }}>
+            {historyData.map((item, index) => (
+              <View 
+                key={item.id} 
+                style={[
+                  styles.card, 
+                  { 
+                    marginBottom: 12, 
+                    backgroundColor: index === 0 ? '#f0fdf4' : '#ffffff',
+                    borderColor: index === 0 ? '#22c55e' : '#e2e8f0'
+                  }
+                ]}
+              >
+                <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
+                  <Text style={{ fontSize: 13, fontWeight: '700', color: '#111827' }}>
+                    {formatTimestamp(item.timestamp)}
+                  </Text>
+                  {index === 0 && (
+                    <View style={{ backgroundColor: '#22c55e', paddingHorizontal: 8, paddingVertical: 2, borderRadius: 12 }}>
+                      <Text style={{ color: '#ffffff', fontSize: 11, fontWeight: '600' }}>최신</Text>
+                    </View>
+                  )}
+                </View>
+                
+                <View style={{ flexDirection: 'row', justifyContent: 'space-around', marginTop: 8 }}>
+                  <View style={{ alignItems: 'center' }}>
+                    <Text style={{ fontSize: 11, color: '#6b7280', marginBottom: 4 }}>온도</Text>
+                    <Text style={{ fontSize: 18, fontWeight: '700', color: '#f97316' }}>
+                      {(() => {
+                        const temp = item.temperature ?? item.temp;
+                        return typeof temp === 'number' ? temp.toFixed(1) : '--';
+                      })()}°C
+                    </Text>
+                  </View>
+                  
+                  <View style={{ alignItems: 'center' }}>
+                    <Text style={{ fontSize: 11, color: '#6b7280', marginBottom: 4 }}>습도</Text>
+                    <Text style={{ fontSize: 18, fontWeight: '700', color: '#0ea5e9' }}>
+                      {(() => {
+                        const hum = item.humidity ?? item.hum;
+                        return typeof hum === 'number' ? hum.toFixed(1) : '--';
+                      })()}%
+                    </Text>
+                  </View>
+                  
+                  <View style={{ alignItems: 'center' }}>
+                    <Text style={{ fontSize: 11, color: '#6b7280', marginBottom: 4 }}>조도</Text>
+                    <Text style={{ fontSize: 18, fontWeight: '700', color: '#eab308' }}>
+                      {(() => {
+                        const lux = item.light_level ?? item.lux ?? item.lightLevel;
+                        return typeof lux === 'number' ? Math.round(lux) : '--';
+                      })()}} lx
+                    </Text>
+                  </View>
+                </View>
+              </View>
+            ))}
+          </View>
+        )}
+
+      </ScrollView>
+      <BottomNav navigation={navigation} current={null} />
+    </SafeAreaView>
   );
 }
 
@@ -1900,7 +2561,7 @@ export default function App() {
       plantType: "첫번째 정원",
       waterAlert: false,
       lightAlert: true,
-      image: null,
+      image: require('./assets/images/background.jpg'),
       temp: 22,
       hum: 55,
       lux: 55,
@@ -1909,6 +2570,64 @@ export default function App() {
     { name: "선인장방", plantType: "다육식물", waterAlert: false, lightAlert: true, image: null, temp: 26, hum: 30, lux: 80 },
   ]);
   const [activeIndex, setActiveIndex] = useState(0);
+
+  // 앱 시작 시 저장된 데이터 로드
+  useEffect(() => {
+    loadData();
+  }, []);
+
+  // 데이터 로드
+  const loadData = async () => {
+    try {
+      const savedTerrariums = await AsyncStorage.getItem('terrariums');
+      const savedActiveIndex = await AsyncStorage.getItem('activeIndex');
+      
+      if (savedTerrariums) {
+        const parsed = JSON.parse(savedTerrariums);
+        // 이미지 경로 복원
+        const restored = parsed.map(t => {
+          if (t.imagePath === 'background') {
+            return { ...t, image: require('./assets/images/background.jpg') };
+          }
+          return t;
+        });
+        setTerrariums(restored);
+      }
+      
+      if (savedActiveIndex) {
+        setActiveIndex(parseInt(savedActiveIndex));
+      }
+    } catch (error) {
+      console.warn('데이터 로드 실패:', error);
+    }
+  };
+
+  // 데이터 저장
+  const saveData = async (newTerrariums, newActiveIndex) => {
+    try {
+      // 이미지 객체를 경로로 변환
+      const toSave = newTerrariums.map(t => {
+        if (t.image && typeof t.image === 'object' && t.image.uri) {
+          return { ...t, image: t.image.uri, imagePath: null };
+        } else if (t.image && typeof t.image === 'number') {
+          return { ...t, image: null, imagePath: 'background' };
+        }
+        return { ...t, imagePath: null };
+      });
+      
+      await AsyncStorage.setItem('terrariums', JSON.stringify(toSave));
+      await AsyncStorage.setItem('activeIndex', newActiveIndex.toString());
+    } catch (error) {
+      console.warn('데이터 저장 실패:', error);
+    }
+  };
+
+  // terrariums 변경 시 자동 저장
+  useEffect(() => {
+    if (terrariums.length > 0) {
+      saveData(terrariums, activeIndex);
+    }
+  }, [terrariums, activeIndex]);
 
   return (
     <NavigationContainer>
@@ -1990,6 +2709,9 @@ export default function App() {
         </Stack.Screen>
         <Stack.Screen name="Background">
           {(props) => <BackgroundScreen {...props} />}
+        </Stack.Screen>
+        <Stack.Screen name="SensorHistory">
+          {(props) => <SensorHistoryScreen {...props} />}
         </Stack.Screen>
       </Stack.Navigator>
     </NavigationContainer>
@@ -2108,6 +2830,28 @@ const styles = StyleSheet.create({
     alignItems: "center",
   },
   dot: {
+    width: 8,
+    height: 8,
+    borderRadius: 4,
+    backgroundColor: "#cbd5e1",
+    marginHorizontal: 4,
+  },
+  dotActive: {
+    backgroundColor: "#145c35",
+    width: 24,
+  },
+  moodButton: {
+    width: 56,
+    height: 56,
+    borderRadius: 28,
+    backgroundColor: '#f8fafc',
+    borderWidth: 2,
+    borderColor: '#e5e7eb',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  /* Sensor circles */
+  sensorCircleBox: {
     width: 6,
     height: 6,
     borderRadius: 3,
